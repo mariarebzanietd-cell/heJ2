@@ -1,0 +1,166 @@
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# ---------- SETTINGS ----------
+SEED = 42
+N_ROWS = 50_000
+# Kaggle flights file(s), downloaded by hand and put in THE SAME FOLDER as this script
+KAGGLE_FILES = ["airlines_flights_data.csv", "kaggle_flights.csv"]
+REQUIRE_KAGGLE = True                # True = stop with a clear message if no Kaggle file (no silent simulation)
+KAGGLE_DATASET = ""                  # optional: Kaggle ref "user/dataset-name" (automatic download, needs kaggle token)
+AIRLINE_NAMES = ["airline", "carrier", "compagnie"]   # column names looked for in the Kaggle file
+FLIGHT_NAMES = ["flight", "vol"]
+ADD_DIRTY_DATA = True                # adds duplicates / missing values for the ETL step
+OUTPUT = "dataset_hadj_omra_final.csv"
+
+rng = np.random.default_rng(SEED)
+
+# ---------- 1. FLIGHTS (Kaggle if possible, otherwise simulated) ----------
+def find_column(df, names):
+    """Exact name first, then 'contains' (case-insensitive)."""
+    low = {c.lower(): c for c in df.columns}
+    for n in names:
+        if n in low:
+            return low[n]
+    for n in names:
+        for l, original in low.items():
+            if n in l:
+                return original
+    return None
+
+def load_kaggle_flights():
+    """Return a DataFrame [airline, flight] built from Kaggle, or None."""
+    csv_files = [Path(f) for f in KAGGLE_FILES if Path(f).exists()]
+    if not csv_files and KAGGLE_DATASET:
+        try:
+            import kagglehub
+            csv_files = list(Path(kagglehub.dataset_download(KAGGLE_DATASET)).rglob("*.csv"))
+        except Exception as e:
+            print("Kaggle download failed:", e)
+    for path in csv_files:
+        kaggle = pd.read_csv(path)
+        airline_col = find_column(kaggle, AIRLINE_NAMES)
+        flight_col = find_column(kaggle, FLIGHT_NAMES)
+        if airline_col and flight_col:
+            print(f"Kaggle file used: {path.name} | airline = '{airline_col}', flight = '{flight_col}'")
+            out = kaggle[[airline_col, flight_col]].dropna().drop_duplicates().astype(str)
+            out.columns = ["airline", "flight"]
+            return out
+        print(f"{path.name}: airline/flight columns not found. Columns are: {list(kaggle.columns)}")
+    return None
+
+flights = load_kaggle_flights()
+if flights is not None:
+    flight_source = "Kaggle"
+elif REQUIRE_KAGGLE:
+    here = [p.name for p in Path(".").glob("*.csv")]
+    raise SystemExit(
+        "\nKaggle flights file NOT FOUND.\n"
+        f"Put one of these files in the script folder: {KAGGLE_FILES}\n"
+        f"CSV files seen in this folder: {here}\n"
+        "(set REQUIRE_KAGGLE = False to use simulated flights instead)")
+else:
+    print("No usable Kaggle data -> simulated flights are used.")
+    codes = {"Air Algérie": "AH", "Saudia": "SV", "flynas": "XY", "Air Cairo": "SM", "Nouvelair": "BJ"}
+    rows = [(name, f"{code}{n}") for name, code in codes.items() for n in rng.integers(100, 9999, 20)]
+    flights = pd.DataFrame(rows, columns=["airline", "flight"])
+    flight_source = "Simulated"
+
+# an airline and its flight number are always taken together (coherent rows)
+pick = flights.sample(N_ROWS, replace=True, random_state=SEED).reset_index(drop=True)
+
+# ---------- 2. PACKAGES AND SEASONS ----------
+# departure windows (CHANGE the dates if you use another year: check the Ramadan/Hajj calendar)
+SEASONS = {
+    ("Hajj", "Standard ONPO"): [("2024-05-15", "2024-06-08")],   # flights before Hajj
+    ("Omra", "Ramadan"):       [("2024-03-11", "2024-04-09")],   # flights during Ramadan
+    ("Omra", "Standard"):      [("2024-01-05", "2024-02-29"), ("2024-07-01", "2024-12-20")],
+    ("Omra", "VIP"):           [("2024-01-05", "2024-02-29"), ("2024-07-01", "2024-12-20")],
+}
+packages = pd.DataFrame([
+    ("Hajj", "Standard ONPO", 650_000, 0.88, 0.10, "Hajj season"),
+    ("Omra", "Ramadan",      220_000, 0.85, 0.25, "Ramadan"),
+    ("Omra", "Standard",     145_000, 0.85, 0.50, "Regular"),
+    ("Omra", "VIP",          450_000, 0.80, 0.15, "Regular"),
+], columns=["trip_type", "package", "base_price", "cost_ratio", "weight", "season"])
+
+pk = packages.iloc[rng.choice(len(packages), N_ROWS, p=packages["weight"])].reset_index(drop=True)
+
+def random_departure(trip, package):
+    windows = SEASONS[(trip, package)]
+    start, end = windows[rng.integers(len(windows))]
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    return start + pd.Timedelta(days=int(rng.integers(0, (end - start).days + 1)))
+
+departure_date = pd.Series(pd.to_datetime(
+    [random_departure(t, p) for t, p in zip(pk["trip_type"], pk["package"])]))
+reservation_date = departure_date - pd.to_timedelta(rng.integers(20, 121, N_ROWS), unit="D")
+
+# ---------- PRICES AND COSTS (assumptions, not real market prices) ----------
+lead_days = (departure_date - reservation_date).dt.days.to_numpy()   # days between booking and departure
+is_omra = (pk["trip_type"] == "Omra").to_numpy()
+# Omra only (the Hajj price is fixed by the state organisation): early-bird -5%, last-minute +3%
+discount_pct = np.where(is_omra & (lead_days >= 90), 0.05,
+               np.where(is_omra & (lead_days <= 30), -0.03, 0.0))
+price = (pk["base_price"] * (1 - discount_pct) * rng.uniform(0.98, 1.02, N_ROWS)).round(-3).astype(int)
+cost = (pk["base_price"] * pk["cost_ratio"] * rng.uniform(0.98, 1.02, N_ROWS)).round(-3).astype(int)
+
+# ---------- 3. PILGRIMS ----------
+cities = ["Alger", "Oran", "Constantine", "Annaba", "Blida", "Batna",
+          "Sétif", "Tlemcen", "Béjaïa", "Ghardaïa", "Tizi Ouzou", "Djelfa"]
+city_w = [.20, .14, .10, .06, .08, .06, .10, .05, .05, .04, .07, .05]
+agencies = ["El Imane Voyages", "Al Buraq Travel", "Safir Tours",
+            "Nour El Islam", "El Houda", "Al Fajr Tourisme"]
+channels = ["Word of mouth", "Facebook", "Instagram", "Walk-in agency", "Mosque/association"]
+channel_w = [.38, .22, .12, .18, .10]
+
+late = rng.random(N_ROWS) < 0.20                      # documents late
+u = rng.random(N_ROWS)
+p_cancel = np.where(late, 0.15, 0.03)                 # late documents -> more cancellations
+p_cancel = np.where(lead_days >= 90, p_cancel * 0.6, p_cancel)   # early bookings cancel less
+status = np.where(u < p_cancel, "Cancelled",
+         np.where(u < p_cancel + 0.12, "Pending", "Confirmed"))
+
+amount_paid = np.where(status == "Confirmed", price,
+              np.where(status == "Pending", (price * 0.3).round(-3), 0)).astype(int)
+satisfaction = np.clip(np.round(rng.normal(4.2, 0.8, N_ROWS) - 0.7 * late), 1, 5)
+satisfaction = np.where(status == "Confirmed", satisfaction, np.nan)
+
+channel = rng.choice(channels, N_ROWS, p=channel_w)
+# marketing cost to get one pilgrim, by channel (assumptions, in DZD)
+channel_cost = {"Word of mouth": 2_000, "Facebook": 9_000, "Instagram": 8_000,
+                "Walk-in agency": 3_000, "Mosque/association": 2_500}
+acq_cost = pd.Series(channel).map(channel_cost).to_numpy()
+profit = np.where(status == "Confirmed", price - cost - acq_cost, 0)
+
+df = pd.DataFrame({
+    "reservation_id": np.arange(1, N_ROWS + 1),
+    "gender": rng.choice(["Male", "Female"], N_ROWS, p=[.48, .52]),
+    "age": np.clip(rng.normal(55, 13, N_ROWS).round(), 18, 85).astype(int),
+    "departure_city": rng.choice(cities, N_ROWS, p=city_w),
+    "agency": rng.choice(agencies, N_ROWS),
+    "channel": channel,
+    "trip_type": pk["trip_type"], "package": pk["package"], "season": pk["season"],
+    "price_dzd": price, "cost_dzd": cost, "discount_pct": discount_pct,
+    "acquisition_cost_dzd": acq_cost, "profit_dzd": profit,
+    "reservation_date": reservation_date.dt.date, "departure_date": departure_date.dt.date,
+    "status": status, "amount_paid_dzd": amount_paid,
+    "documents_late": np.where(late, "Yes", "No"),
+    "airline": pick["airline"], "flight": pick["flight"],
+    "flight_source": flight_source,
+    "satisfaction_1_5": satisfaction,
+})
+
+# ---------- 4. OPTIONAL: messy data so the ETL step has real cleaning to do ----------
+if ADD_DIRTY_DATA:
+    k = int(0.03 * N_ROWS)
+    df["age"] = df["age"].astype(float)
+    df.loc[rng.choice(N_ROWS, k, replace=False), "age"] = np.nan           # missing ages
+    messy = rng.choice(N_ROWS, k, replace=False)
+    df.loc[messy, "departure_city"] = df.loc[messy, "departure_city"].str.lower() + " "  # bad text
+    df = pd.concat([df, df.sample(int(0.02 * N_ROWS), random_state=SEED)], ignore_index=True)  # duplicates
+
+df.to_csv(OUTPUT, index=False, encoding="utf-8")
+print(f"{len(df)} rows saved in {OUTPUT} (flights: {flight_source})")
+print(df["status"].value_counts(normalize=True).round(3))
